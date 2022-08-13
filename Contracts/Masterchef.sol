@@ -1281,9 +1281,6 @@ contract MasterChef is Ownable, ReentrancyGuard {
     using SafeMath for uint256;
     using SafeERC20 for IERC20;
 
-    // The operator
-    address private _operator;
-
    // Info of each Deposit.
     struct DepositInfo {
         uint256 pid;
@@ -1307,9 +1304,9 @@ contract MasterChef is Ownable, ReentrancyGuard {
     // Info of each pool.
     struct PoolInfo {
         IERC20 lpToken;           // Address of LP token contract.
-        uint256 allocPoint;       // How many allocation points assigned to this pool. BQBs to distribute per block.
-        uint256 lastRewardBlock;  // Last block number that BQBs distribution occurs.
-        uint256 accStarPerShare;   // Accumulated BQBs per share, times 1e12. See below.
+        uint256 allocPoint;       // How many allocation points assigned to this pool. STARs to distribute per block.
+        uint256 lastRewardBlock;  // Last block number that STARs distribution occurs.
+        uint256 accStarPerShare;   // Accumulated STARs per share, times 1e12. See below.
         uint16 depositFeeBP;      // Deposit fee in basis points
         uint256 harvestInterval;  // Harvest interval in seconds
         uint256 totalStakedTokens;  // total count of staked tokens
@@ -1326,14 +1323,13 @@ contract MasterChef is Ownable, ReentrancyGuard {
 
     // STAR tokens created per block.
     uint256 public STARPerBlock = 50 * 10**18;
-    uint256 public initialSTARPerBlock = 100 * 10 ** 18;          // 10 STAR until first 10 days
 
     // Bonus muliplier for early STAR makers.
     uint256 public constant BONUS_MULTIPLIER = 1;
 
     // First day and default harvest interval
     uint256 public constant DEFAULT_HARVEST_INTERVAL = 1 minutes;
-    uint256 public constant MAX_HARVEST_INTERVAL = 15 minutes;  //1 days;
+    uint256 public constant MAX_HARVEST_INTERVAL = 1 days;
     uint256 public lockUpTaxRate = 5000;                        // 50%
 
     // Info of each pool.
@@ -1344,15 +1340,6 @@ contract MasterChef is Ownable, ReentrancyGuard {
 
     // Total allocation points. Must be the sum of all allocation points in all pools.
     uint256 public totalAllocPoint = 0;
-
-    // STAR referral contract address.
-    IStarSwapReferral public StarReferral;
-    
-    // Referral commission rate in basis points.
-    uint16 public referralCommissionRate = 100;
-    
-    // Max referral commission rate: 10%.
-    uint16 public constant MAXIMUM_REFERRAL_COMMISSION_RATE = 1000;
     
     // The block number and timestamp when STAR mining starts.
     bool public enableStartSTARReward = false;
@@ -1360,13 +1347,11 @@ contract MasterChef is Ownable, ReentrancyGuard {
 
     mapping(uint8 => bool) public enableStaking;
 
-    // Informations to get daily ETH reward for calculating APR of ETH rewards in staking STAR
-    struct ETHRewardInfo {
-        uint256 timestamp;
-        uint256 totalAmountFromFee;
-    }
-    mapping(uint256 => ETHRewardInfo) public ETHRewardInfoAtId;
-    uint public currentETHRewardID;
+    // Parameters to mint STAR tokens to owner
+    uint256 private lastMinttoDev;
+    uint256 private totalMintedSTARofDev;
+    uint256 constant MAXIMUM_TRANSFER_TO_DEVELOPER = 100_000_000 * 10 ** 18;            // 100M STAR for developer
+    uint256 constant MAXIMUM_TRANSFER_TO_DEVELOPER_MONTHLY = 1_000_000 * 10 ** 18;      // 1M STAR
     
     event Deposit(address indexed user, uint256 indexed pid, uint256 amount);
     event Withdraw(address indexed user, uint256 indexed pid, uint256 amount);
@@ -1375,16 +1360,10 @@ contract MasterChef is Ownable, ReentrancyGuard {
     event ReferralCommissionPaid(address indexed user, address indexed referrer, uint256 commissionAmount);
     event OperatorTransferred(address indexed previousOperator, address indexed newOperator);
 
-    modifier onlyOperator() {
-        require(_operator == msg.sender, "operator: caller is not the operator");
-        _;
-    }
-
     constructor (address _starSwapToken) {
         STAR = _starSwapToken;
 
         feeAddress = msg.sender;
-        _operator = _starSwapToken;
     }
 
     receive() external payable {
@@ -1405,17 +1384,6 @@ contract MasterChef is Ownable, ReentrancyGuard {
             poolInfo[pid].lastRewardBlock = 
                 block.number > poolInfo[pid].lastRewardBlock ? block.number : poolInfo[pid].lastRewardBlock;
         }
-    }
-
-    /**
-     * @dev Set operator of the contract to a new account (`newOperator`).
-     * Can only be called by the current operator.
-     */
-    function setOperator(address newOperator) public onlyOwner {
-        require(newOperator != address(0), "StarSwap::transferOperator: new operator is the zero address");
-        emit OperatorTransferred(_operator, newOperator);
-
-        _operator = newOperator;
     }
     
     function poolLength() external view returns (uint256) {
@@ -1456,34 +1424,16 @@ contract MasterChef is Ownable, ReentrancyGuard {
         poolInfo[_pid].harvestInterval = DEFAULT_HARVEST_INTERVAL;
     }
 
+    // STAR has to add hidden dummy pools in order to alter the emission, here we make it simple and transparent to all.
+    function updateEmissionRate(uint256 _STARPerBlock) public onlyOwner {
+        massUpdatePools();
+        emit EmissionRateUpdated(msg.sender, STARPerBlock, _STARPerBlock);
+        STARPerBlock = _STARPerBlock;
+    }
+
     // Return reward multiplier over the given _from to _to block.
     function getMultiplier(uint256 _from, uint256 _to) public pure returns (uint256) {
         return _to.sub(_from).mul(BONUS_MULTIPLIER);
-    }
-    
-    function getTotalSTARRewardFromBlock() public view returns (uint256) {
-        if (!enableStartSTARReward) {
-            return 0;
-        }
-            
-        uint256 multiplier;
-        uint256 starSwapReward;
-
-        uint256 midBlock = startBlock + 10 days;           // 10 days from start day
-
-        if (midBlock < block.number) {
-            multiplier = getMultiplier(startBlock, midBlock);
-            starSwapReward = multiplier.mul(initialSTARPerBlock);
-            
-            multiplier = getMultiplier(midBlock, block.number);
-            starSwapReward.add(multiplier.mul(STARPerBlock));
-        }
-        else {
-            multiplier = getMultiplier(startBlock, block.number);
-            starSwapReward = multiplier.mul(initialSTARPerBlock);
-        }
-        
-        return starSwapReward;
     }
     
     function getSTARRewardFromBlock(uint8 _pid) public view returns (uint256) {
@@ -1491,34 +1441,17 @@ contract MasterChef is Ownable, ReentrancyGuard {
             return 0;
         }
             
-        PoolInfo storage pool = poolInfo[_pid];    
-            
         uint256 multiplier;
         uint256 starSwapReward = 0;
         
-        uint256 midBlock = startBlock + 10 days;                // 10 days from start day
-        if (pool.lastRewardBlock > midBlock) {
-            multiplier = getMultiplier(pool.lastRewardBlock, block.number);
-            starSwapReward = multiplier.mul(STARPerBlock);
-        }
-        else {
-            if (midBlock < block.number) {
-                multiplier = getMultiplier(pool.lastRewardBlock, midBlock);
-                starSwapReward = multiplier.mul(initialSTARPerBlock);
-                
-                multiplier = getMultiplier(midBlock, block.number);
-                starSwapReward.add(multiplier.mul(STARPerBlock));
-            }
-            else {
-                multiplier = getMultiplier(pool.lastRewardBlock, block.number);
-                starSwapReward = multiplier.mul(initialSTARPerBlock);
-            }
-        }
+        PoolInfo storage pool = poolInfo[_pid];    
+        multiplier = getMultiplier(pool.lastRewardBlock, block.number);
+        starSwapReward = multiplier.mul(STARPerBlock);
         
         return starSwapReward;
     }
 
-    // View function to see pending BQBs on frontend.
+    // View function to see pending STARs on frontend.
     function pendingSTAR(uint8 _pid, address _user) 
         public view returns (uint256 totalPending, uint256 claimablePending) {
         PoolInfo storage pool = poolInfo[_pid];
@@ -1638,7 +1571,7 @@ contract MasterChef is Ownable, ReentrancyGuard {
     }
 
     // Deposit LP tokens to MasterChef for STAR allocation.
-    function deposit(uint8 _pid, uint256 _amount, address _referrer) public nonReentrant {
+    function deposit(uint8 _pid, uint256 _amount) public nonReentrant {
         require(enableStaking[_pid] == true, 'Deposite: DISABLE DEPOSITING');
         require(_amount > 0, 'Deposite: DISABLE DEPOSITING');
         
@@ -1646,12 +1579,6 @@ contract MasterChef is Ownable, ReentrancyGuard {
         UserInfo storage user = userInfo[_pid][msg.sender];
 
         updatePool(_pid);
-
-        if (address(StarReferral) != address(0) 
-                && _referrer != address(0) 
-                && _referrer != msg.sender) {
-            StarReferral.recordReferral(msg.sender, _referrer);
-        }
 
         pool.lpToken.safeTransferFrom(address(msg.sender), address(this), _amount);
 
@@ -1870,6 +1797,9 @@ contract MasterChef is Ownable, ReentrancyGuard {
         user.nextHarvestUntil = 0;
         pool.lpToken.safeTransfer(address(msg.sender), amount);
         pool.totalStakedTokens -= amount;
+
+        delete depositInfo[msg.sender][_pid];
+
         emit EmergencyWithdraw(msg.sender, _pid, amount);
     }
 
@@ -1890,7 +1820,6 @@ contract MasterChef is Ownable, ReentrancyGuard {
 
                 // send STAR rewards
                 safeSTARTransfer(msg.sender, claimablePending);
-                payReferralCommission(msg.sender, claimablePending);
 
                 user.totalEarnedSTAR = user.totalEarnedSTAR.add(claimablePending);
                 user.taxAmount = taxPending;
@@ -1916,7 +1845,6 @@ contract MasterChef is Ownable, ReentrancyGuard {
 
                 // send STAR rewards
                 safeSTARTransfer(msg.sender, claimablePending);
-                payReferralCommission(msg.sender, claimablePending);
 
                 user.totalEarnedSTAR = user.totalEarnedSTAR.add(claimablePending);
                 user.taxAmount = taxPending;
@@ -1979,39 +1907,22 @@ contract MasterChef is Ownable, ReentrancyGuard {
         }
     }
 
-    // STAR has to add hidden dummy pools in order to alter the emission, here we make it simple and transparent to all.
-    function updateEmissionRate(uint256 _STARPerBlock) public onlyOwner {
-        massUpdatePools();
-        emit EmissionRateUpdated(msg.sender, STARPerBlock, _STARPerBlock);
-        STARPerBlock = _STARPerBlock;
-    }
-
-    // Update the STAR referral contract address by the owner
-    function setSTARReferral(IStarSwapReferral _StarReferral) public onlyOwner {
-        StarReferral = _StarReferral;
-    }
-
-    // Update referral commission rate by the owner
-    function setReferralCommissionRate(uint16 _referralCommissionRate) public onlyOwner {
-        require(_referralCommissionRate <= MAXIMUM_REFERRAL_COMMISSION_RATE, "setReferralCommissionRate: invalid referral commission rate basis points");
-        referralCommissionRate = _referralCommissionRate;
-    }
-
-    // Pay referral commission to the referrer who referred this user.
-    function payReferralCommission(address _user, uint256 _pending) internal {
-        if (address(StarReferral) != address(0) && referralCommissionRate > 0) {
-            address referrer = StarReferral.getReferrer(_user);
-            uint256 commissionAmount = _pending.mul(referralCommissionRate).div(10000);
-
-            if (referrer != address(0) && commissionAmount > 0) {
-                StarSwap(STAR).mint(referrer, commissionAmount);
-                StarReferral.recordReferralCommission(referrer, commissionAmount);
-                emit ReferralCommissionPaid(_user, referrer, commissionAmount);
-            }
-        }
-    }
-
     function transferOwnershipOfSTAR() public onlyOwner {
         StarSwap(STAR).transferOwnership(msg.sender);
+    }
+
+    function VestedDevAllocationMontlyTransfer(uint256 _amount) public onlyOwner {
+        require(_amount <= MAXIMUM_TRANSFER_TO_DEVELOPER_MONTHLY, "StarSwap::transfer: too much amount monthly");
+        require(block.timestamp - lastMinttoDev > 30 days, 'Need to wait 1 month');
+        require(totalMintedSTARofDev < MAXIMUM_TRANSFER_TO_DEVELOPER, 'StarSwap::transfer: too much amount');
+
+        if (_amount > (MAXIMUM_TRANSFER_TO_DEVELOPER - totalMintedSTARofDev))
+            _amount = MAXIMUM_TRANSFER_TO_DEVELOPER - totalMintedSTARofDev;
+        
+        totalMintedSTARofDev += _amount;
+        
+        lastMinttoDev = block.timestamp;
+        
+        StarSwap(STAR).mint(owner(), _amount);
     }
 }
